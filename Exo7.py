@@ -1,160 +1,104 @@
 import gurobipy as gp
 from gurobipy import GRB
- 
 import numpy as np
- 
- 
-# 24 Hour Load Forecast (MW)
+
+# ------------------ Donnees ------------------
 load_forecast = [
      4,  4,  4,  4,  4,  4,   6,   6,
     12, 12, 12, 12, 12,  4,   4,   4,
      4, 16, 16, 16, 16,  6.5, 6.5, 6.5,
 ]
- 
-# solar energy forecast (MW)
 solar_forecast = [
     0,   0,   0,   0,   0,   0,   0.5, 1.0,
     1.5, 2.0, 2.5, 3.5, 3.5, 2.5, 2.0, 1.5,
     1.0, 0.5, 0,   0,   0,   0,   0,   0,
 ]
- 
-# global number of time intervals
-nTimeIntervals = len(load_forecast)
- 
-# thermal units
-thermal_units = ["gen1", "gen2", "gen3"]
- 
-# thermal units' costs  (a + b*p + c*p^2), (startup and shutdown costs)
-thermal_units_cost, a, b, c, sup_cost, sdn_cost = gp.multidict(
-    {
-        "gen1": [5.0, 0.5, 1.0, 2, 1],
-        "gen2": [5.0, 0.5, 0.5, 2, 1],
-        "gen3": [5.0, 3.0, 2.0, 2, 1],
-    }
-)
- 
+T = len(load_forecast)
+required_power = [l - s for l, s in zip(load_forecast, solar_forecast)]
 
-thermal_units_limits, pmin, pmax = gp.multidict(
-    {"gen1": [1.5, 5.0], "gen2": [2.5, 10.0], "gen3": [1.0, 3.0]}
+thermal_units = ["gen1", "gen2", "gen3"]
+
+# costs: a + b*p + c*p^2, startup, shutdown
+_, a, b, c, sup_cost, sdn_cost = gp.multidict(
+    {"gen1":[5.0, 0.5, 1.0, 2, 1],
+     "gen2":[5.0, 0.5, 0.5, 2, 1],
+     "gen3":[5.0, 3.0, 2.0, 2, 1]}
 )
- 
-# thermal units dynamic data (initial commitment status)
-thermal_units_dyn_data, init_status = gp.multidict(
-    {"gen1": [0], "gen2": [0], "gen3": [0]}
+_, pmin, pmax = gp.multidict(
+    {"gen1":[1.5, 5.0], "gen2":[2.5, 10.0], "gen3":[1.0, 3.0]}
 )
- 
- 
-# We need np.array instances instead of dict instances to use
-# the matrix API
-def dict_to_array(keys, d):
-    return np.array([d[k] for k in keys])
- 
-a = dict_to_array(thermal_units, a)
-b = dict_to_array(thermal_units, b)
-c = dict_to_array(thermal_units, c)
-sup_cost = dict_to_array(thermal_units, sup_cost)
-sdn_cost = dict_to_array(thermal_units, sdn_cost)
-pmin = dict_to_array(thermal_units, pmin)
-pmax = dict_to_array(thermal_units, pmax)
-init_status = dict_to_array(thermal_units, init_status)
- 
-# We also need to turn to integer indices instead of strings
-units_to_index = {u: idx for idx, u in enumerate(thermal_units)}
-nb_units = len(thermal_units)
- 
- 
-def show_results():
-    obj_val_s = model.ObjVal
-    print(f" OverAll Cost = {round(obj_val_s, 2)}	")
-    print("\n")
+_, init_status = gp.multidict({"gen1":[0], "gen2":[0], "gen3":[0]})
+
+G = range(len(thermal_units))
+TT = range(T)
+
+def show_results(model, p, y):
+    print(f"OverAll Cost = {model.ObjVal:.2f}\n")
     print("%5s" % "time", end=" ")
-    for t in range(nTimeIntervals):
+    for t in TT:
         print("%4s" % t, end=" ")
     print("\n")
- 
-    for g in thermal_units:
+    for gi, g in enumerate(thermal_units):
         print("%5s" % g, end=" ")
-        for t in range(nTimeIntervals):
-            print("%4.1f" % thermal_units_out_power[units_to_index[g], t].X, end=" ")
+        for t in TT:
+            print("%4.1f" % p[gi,t].X, end=" ")
         print("\n")
- 
     print("%5s" % "Solar", end=" ")
-    for t in range(nTimeIntervals):
+    for t in TT:
         print("%4.1f" % solar_forecast[t], end=" ")
     print("\n")
- 
     print("%5s" % "Load", end=" ")
-    for t in range(nTimeIntervals):
+    for t in TT:
         print("%4.1f" % load_forecast[t], end=" ")
     print("\n")
- 
- 
+
+# ------------------ Modele sans SciPy ------------------
 with gp.Env() as env, gp.Model(env=env) as model:
- 
-    # add variables for thermal units (power and statuses for commitment, startup and shutdown)
-    thermal_units_out_power = model.addMVar(
-        (nb_units, nTimeIntervals), name="thermal_units_out_power"
+    # Variables indexees (pas de MVar)
+    p  = model.addVars(G, TT, lb=0.0, name="p")                 # puissance
+    y  = model.addVars(G, TT, vtype=GRB.BINARY, name="y")       # commitment
+    su = model.addVars(G, TT, vtype=GRB.BINARY, name="su")      # startup
+    sd = model.addVars(G, TT, vtype=GRB.BINARY, name="sd")      # shutdown
+
+    # Objectif: somme de (a*y + b*p + c*p^2 + sup_cost*su + sdn_cost*sd)
+    obj = gp.quicksum(
+        a[thermal_units[gi]] * y[gi,t] +
+        b[thermal_units[gi]] * p[gi,t] +
+        c[thermal_units[gi]] * (p[gi,t] * p[gi,t]) +
+        sup_cost[thermal_units[gi]] * su[gi,t] +
+        sdn_cost[thermal_units[gi]] * sd[gi,t]
+        for gi in G for t in TT
     )
-    thermal_units_startup_status = model.addMVar(
-        (nb_units, nTimeIntervals),
-        vtype=GRB.BINARY,
-        name="thermal_unit_startup_status",
-    )
-    thermal_units_shutdown_status = model.addMVar(
-        (nb_units, nTimeIntervals),
-        vtype=GRB.BINARY,
-        name="thermal_unit_shutdown_status",
-    )
-    thermal_units_comm_status = model.addMVar(
-        (nb_units, nTimeIntervals), vtype=GRB.BINARY, name="thermal_unit_comm_status"
-    )
- 
-    # define objective function as an empty quadratic construct and add terms
-    model.setObjective((a[:, None] * thermal_units_comm_status).sum() +
-                       (b[:, None] * thermal_units_out_power).sum() +
-                       (c[:, None] * (thermal_units_out_power * thermal_units_out_power)).sum() +
-                       (sup_cost[:, None] * thermal_units_startup_status).sum() +
-                       (sdn_cost[:, None] * thermal_units_shutdown_status).sum())
- 
-    # Power balance equations
-    required_power = np.array([l - s for l, s in zip(load_forecast, solar_forecast) ])
-    model.addConstr(
-        thermal_units_out_power.sum(axis=0) == required_power,
+    model.setObjective(obj, GRB.MINIMIZE)
+
+    # Equilibre puissance pour chaque periode
+    model.addConstrs(
+        (gp.quicksum(p[gi,t] for gi in G) == required_power[t] for t in TT),
         name="power_balance"
     )
- 
-    # Thermal units logical constraints
- 
-    # Initial condition (t = 0)
-    model.addConstr(
-        thermal_units_comm_status[:, 0] - init_status ==
-        thermal_units_startup_status[:, 0] - thermal_units_shutdown_status[:, 0],
-        name="logical1_initial"
+
+    # Logique de commitment
+    # t = 0
+    model.addConstrs(
+        (y[gi,0] - init_status[thermal_units[gi]] == su[gi,0] - sd[gi,0] for gi in G),
+        name="logical_initial"
     )
- 
-    # Remaining time intervals (t > 0)
-    model.addConstr(
-        thermal_units_comm_status[:, 1:] - thermal_units_comm_status[:, :-1]
-        == thermal_units_startup_status[:, 1:] - thermal_units_shutdown_status[:, 1:],
-        name="logical1_remaining"
+    # t > 0
+    model.addConstrs(
+        (y[gi,t] - y[gi,t-1] == su[gi,t] - sd[gi,t] for gi in G for t in range(1, T)),
+        name="logical_transitions"
     )
- 
-    model.addConstr(
-        thermal_units_startup_status + thermal_units_shutdown_status <= 1,
-        name="logical2"
-    )
- 
-    # Thermal units physical constraints, using indicator constraints
-    for g in range(len(thermal_units)):
-        model.addGenConstrIndicator(thermal_units_comm_status[g, :], True,
-                                    thermal_units_out_power[g, :] >= pmin[g],
-                                    name="physical_min")
-        model.addGenConstrIndicator(thermal_units_comm_status[g, :], True,
-                                    thermal_units_out_power[g, :] <= pmax[g],
-                                    name="physical_max")
-        model.addGenConstrIndicator(thermal_units_comm_status[g, :], False,
-                                    thermal_units_out_power[g, :] == 0.0,
-                                    name="physical_off")
- 
+    # Pas startup et shutdown en meme temps
+    model.addConstrs((su[gi,t] + sd[gi,t] <= 1 for gi in G for t in TT), name="no_simul")
+
+    # Contraintes physiques via indicateurs
+    for gi in G:
+        gname = thermal_units[gi]
+        for t in TT:
+            model.addGenConstrIndicator(y[gi,t], True,  p[gi,t] >= pmin[gname], name=f"pmin[{gname},{t}]")
+            model.addGenConstrIndicator(y[gi,t], True,  p[gi,t] <= pmax[gname], name=f"pmax[{gname},{t}]")
+            model.addGenConstrIndicator(y[gi,t], False, p[gi,t] == 0.0,          name=f"poff[{gname},{t}]")
+
     model.optimize()
-    show_results()
+    if model.SolCount:
+        show_results(model, p, y)
